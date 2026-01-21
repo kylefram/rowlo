@@ -1,0 +1,17 @@
+# Ignore all files in these directories
+input_videos/*
+output_videos/*
+models/*
+output_data/*
+
+# But allow the directories themselves
+!input_videos/
+!output_videos/
+!models/
+!output_data/
+
+# Allow README or other files if needed
+!input_videos/.gitkeep
+!output_videos/.gitkeep
+!models/.gitkeep
+!output_data/.gitkeep
