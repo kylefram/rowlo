@@ -10,6 +10,10 @@ DEVICE="mps"
 VIDEO_PATH = "input_videos/avis5.mov"
 DETECTION_MODEL_PATH = "models/yolo26x.pt"
 POSE_MODEL_PATH = "models/yolo26x-pose.pt"
+#TRACK_MODEL="bytetrack.yaml"
+TRACK_MODEL="botsort.yaml"
+
+
 OUTPUT_VIDEO_PATH = "output_videos/"
 OUTPUT_CSV_PATH = "output_data/output.csv"
 
@@ -39,7 +43,7 @@ NOSE=[1]
 SKELETON_UPPER_BODY = [(6,7), (6, 8), (8, 10), (7, 9), (9, 11)]
 SKELETON_TRUNK = [(6,12), (7,13), (12,13), (12,14), (13,15)]
 #default boat configuration
-DEF_BOAT = "spspspspc"
+DEF_BOAT = {1:'s',2:'p',3:'s',4:'p',5:'s',6:'p',7:'s',8:'p',9:'c'}
 
 def parse_args():
     p = argparse.ArgumentParser(description="Joint angle detection from video file")
@@ -48,9 +52,10 @@ def parse_args():
     p.add_argument("--def_boat", type=str, default=DEF_BOAT, required=False, help="s=starboard, p=port, c=coxswain")
     p.add_argument("--detection_model", type=str, default=DETECTION_MODEL_PATH, required=False, help="Path to yolov8 pose weights (.pt)")
     p.add_argument("--pose_model", type=str, default=POSE_MODEL_PATH, required=False, help="Path to yolov8 pose weights (-pose.pt)")
+    p.add_argument("--tracker", type=str, default=TRACK_MODEL, required=False, help="Path to tracker config file")
     p.add_argument("--output_video", type=str, default=OUTPUT_VIDEO_PATH, required=False, help="Path to save the output video file")
     p.add_argument("--output_csv", type=str, default=OUTPUT_CSV_PATH, required=False, help="Path to save the output CSV file")
-    p.add_argument("--max_frames", type=int, default=30, required=False, help="Maximum number of frames to process from the video")
+    p.add_argument("--max_frames", type=int, default=60, required=False, help="Maximum number of frames to process from the video")
 
     return p.parse_args()
 
@@ -87,8 +92,11 @@ def main():
         ret, frame = cap.read()
         if not ret:
             break
+        
+        #white canvas
+        #canvas = np.ones((height, width, 3), dtype=np.uint8) * 255
 
-        detection_results = detection.track(frame, persist=True, tracker="bytetrack.yaml", classes=[0,8],device=args.device)[0]
+        detection_results = detection.track(frame, persist=True, tracker=args.tracker, classes=[0],device=args.device)[0]
         boxes = detection_results.boxes
         ids = detection_results.boxes.id.cpu().numpy()
 
@@ -99,15 +107,16 @@ def main():
 
                 person_crop = frame[y1:y2, x1:x2]
                 pose_results = pose(person_crop, device=args.device)[0]
-
+        
                 draw_skeleton(frame[y1:y2, x1:x2], pose_results.keypoints.data.cpu().numpy())
-                data.extend(database_append_rower(i, id, x1, y1, pose_results.keypoints.data.cpu().numpy()))
+                #draw_skeleton(canvas[y1:y2, x1:x2], pose_results.keypoints.data.cpu().numpy())
+                data.extend(database_append_rower(i, id, x1, x2, y1, y2, pose_results.keypoints.data.cpu().numpy()))
             elif box.cls[0] == 8:  # boat
                 print("Boat detected")
                 # Handle boat detection if needed
                 data.append(database_append_boat(i, id, x1, y1, x2, y2))
-                pass
-
+                
+        #frame = np.vstack((frame, canvas))
         out.write(frame)
         cv2.imshow("Annotated Frame", frame)
         k = cv2.waitKey(3) & 0xFF
@@ -116,7 +125,7 @@ def main():
             break
 
     df = pd.DataFrame(data)
-    df = df.set_index(["frame", "rower_id", "keypoint"]).sort_index()
+    df = df.set_index(["frame", "id", "keypoint"]).sort_index()
     df.to_csv(args.output_csv)
 
     cap.release()
@@ -152,7 +161,7 @@ def draw_skeleton(frame,keypoints):
             x, y = int(keypoints[0,idx][0]), int(keypoints[0,idx][1])
             cv2.circle(frame, (x, y), 2, (255, 0, 0), -1)
 
-def database_append_rower(frame_num, rower_id,x1,y1, keypoints):
+def database_append_rower(frame_num, rower_id,x1,x2,y1,y2, keypoints):
     keypoints_data = []
     if keypoints is None or len(keypoints) == 0:
         print ("No keypoints detected.")
@@ -166,12 +175,14 @@ def database_append_rower(frame_num, rower_id,x1,y1, keypoints):
         x, y, conf = keypoint
         yield {
             "frame": frame_num,
-            "id": rower_id,
+            "id": int(rower_id),
             "keypoint": keypoint_name,
-            "x": x,
-            "y": y,
-            "x_rel": x1+x,
-            "y_rel": y1+y,
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "x": x1+x,
+            "y": y1+y,
             "confidence": conf,
             "interpolated": False
         }
@@ -179,10 +190,10 @@ def database_append_rower(frame_num, rower_id,x1,y1, keypoints):
 def database_append_boat(frame_num, boat_id, x1, y1, x2, y2):
     return {
         "frame": frame_num,
-        "id": boat_id,
+        "id": int(boat_id),
         "keypoint": "boat_box",
-        "x1": x1,
-        "y1": y1,
+        "x": x1,
+        "y": y1,
         "x_rel": x2,
         "y_rel": y2
     }

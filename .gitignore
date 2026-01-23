@@ -3,6 +3,7 @@ input_videos/*
 output_videos/*
 models/*
 output_data/*
+.vscode/*
 
 # But allow the directories themselves
 !input_videos/
