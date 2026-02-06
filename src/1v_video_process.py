@@ -127,15 +127,17 @@ def second_pass(args,cap,out,w,h,df,alpha=0.7):
         max_x = df.loc[df['frame'] == i, 'x2'].max()
         max_y = df.loc[df['frame'] == i, 'y2'].max()
         #exponential smooth
+        #we dont need to min/max vs 0 or w/h because that's done in first pass
+        #maybe?
         g_x1.append(alpha * min_x + (1 - alpha) * g_x1[-1])
-        g_y1.append(alpha * min_y + (1 - alpha) * g_y1[-2])
+        g_y1.append(alpha * min_y + (1 - alpha) * g_y1[-1])
         g_y2.append(alpha * max_x + (1 - alpha) * g_y2[-1])
         g_x2.append(alpha * max_y + (1 - alpha) * g_x2[-1])
 
     return df,out
 
 #go through the video once, track rowers and boats, save data to dataframe
-def process_video(args,cap,out,w,h):
+def process_video(args,cap,w,h):
     detection = YOLO(args.detection_model)
     pose  = YOLO(args.pose_model)
     data=[]
