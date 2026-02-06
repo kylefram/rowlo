@@ -88,7 +88,7 @@ def main():
     df = pd.DataFrame(data)
     df = df_postprocess(df)
 
-    df,out = second_pass(args,cap,out,width,height,df)
+    df,out = second_pass(args,cap,out,df)
 
     output_csv = args.output_csv_dir + f"{input_name.split('.')[0].split('/')[-1]}_data.csv"
     df.to_csv(output_csv)
@@ -102,39 +102,108 @@ def main():
     return df
 
 #dynamic crop, drawing skeletons, and adding charts
-def second_pass(args,cap,out,w,h,df,alpha=0.7):
+def second_pass(args,cap,out,df,alp=0.7):
 
-    g_x1 = [df['x1'].min()]
-    g_y1 = [df['y1'].min()]
-    g_x2 = [df['x2'].max()]
-    g_y2 = [df['y2'].max()]
+    bounds = df.groupby('frame')[['x1', 'y1', 'x2', 'y2']].agg(
+        {'x1': 'min', 'y1': 'min', 'x2': 'max', 'y2': 'max'}
+    ).reindex(range(args.max_frames)).interpolate(method='linear')
 
-    for i in tqdm(range(args.max_frames),desc="Annotating frames:"):
+    # Calculate the center (cx, cy) of the bounding box
+    bounds['cx'] = (bounds['x1'] + bounds['x2']) / 2
+    bounds['cy'] = (bounds['y1'] + bounds['y2']) / 2
+
+    # Apply Exponential Weighted Moving Average (EWM) for smooth camera motion
+    # Lower alpha = smoother camera, higher alpha = more twitchy
+    smooth_ops = bounds[['cx', 'cy']].ewm(alpha=alp).mean()
+    bounds['smooth_cx'] = smooth_ops['cx']
+    bounds['smooth_cy'] = smooth_ops['cy']
+    
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Reset video to start
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Pre-calculate center of the screen
+    screen_cx, screen_cy = w // 2, h // 2
+
+    for i in tqdm(range(args.max_frames), desc="Stabilizing & Annotating"):
         ret, frame = cap.read()
-        if not ret:
-            continue
-
-        if not cap.isOpened():
+        if not ret: 
             break
+
+        # If we have tracking data for this frame
+        if i in bounds.index:
+            # Calculate the shift needed: Target (Screen Center) - Source (Rower Center)
+            src_cx = bounds.loc[i, 'smooth_cx']
+            src_cy = bounds.loc[i, 'smooth_cy']
+            
+            dx = screen_cx - src_cx
+            dy = screen_cy - src_cy
+
+            # Create Affine Translation Matrix
+            M = np.float32([[1, 0, dx], [0, 1, dy]])
+
+            # Apply shift (stabilization). borderValue=(0,0,0) creates the black mask.
+            stabilized_frame = cv2.warpAffine(frame, M, (w, h), borderValue=(0, 0, 0))
+
+            # Filter data for current frame
+            frame_data = df[df['frame'] == i]
+            
+            # Draw skeletons on the stabilized frame
+            # We must pass dx, dy so we can shift the keypoints to match the video
+            draw_skeleton_from_df(stabilized_frame, frame_data, dx, dy)
+            
+            out.write(stabilized_frame)
+        else:
+            # Write original frame if no tracking data exists
+            out.write(frame)
+
+    return df, out  
+
+def draw_skeleton_from_df(frame, frame_df, dx, dy):
+    """
+    Draws skeletons from the DataFrame. 
+    Applies dx/dy offset to match the stabilized video.
+    """
+    # Pivot so we can access anatomy by ID: index=id, columns=keypoint
+    # We only care about x, y, confidence
+    pivoted = frame_df.pivot(index='id', columns='keypoint', values=['x', 'y', 'confidence'])
+
+    for person_id, row in pivoted.iterrows():
+        # Helper to get (x,y) tuple shifted by dx, dy
+        def get_pt(name):
+            try:
+                x = int(row['x'][name] + dx)
+                y = int(row['y'][name] + dy)
+                conf = row['confidence'][name]
+                return (x, y), conf
+            except KeyError:
+                return None, 0.0
+
+        # Draw Lines (Limbs)
+        # Using SKELETON_UPPER_BODY and SKELETON_TRUNK global definitions
+        # Note: Your globals use Indices (6,7), but DF uses Names ("L_Shoulder")
+        # We need to map indices back to names for the DF lookup
         
-        if not i in df['frame'].values:
-            #if we don't have data for this frame, skip
-            continue
+        all_connections = SKELETON_UPPER_BODY + SKELETON_TRUNK
+        colors = [(0, 255, 0)] * len(SKELETON_UPPER_BODY) + [(0, 0, 255)] * len(SKELETON_TRUNK)
+        
+        for connection, color in zip(all_connections, colors):
+            k1_idx, k2_idx = connection
+            k1_name = KEYPOINT_DICT.get(k1_idx)
+            k2_name = KEYPOINT_DICT.get(k2_idx)
+            
+            if k1_name and k2_name:
+                pt1, conf1 = get_pt(k1_name)
+                pt2, conf2 = get_pt(k2_name)
+                
+                if conf1 > 0.5 and conf2 > 0.5: # Threshold
+                    cv2.line(frame, pt1, pt2, color, 2)
 
-        #define the box
-        min_x = df.loc[df['frame'] == i, 'x1'].min()
-        min_y = df.loc[df['frame'] == i, 'y1'].min()
-        max_x = df.loc[df['frame'] == i, 'x2'].max()
-        max_y = df.loc[df['frame'] == i, 'y2'].max()
-        #exponential smooth
-        #we dont need to min/max vs 0 or w/h because that's done in first pass
-        #maybe?
-        g_x1.append(alpha * min_x + (1 - alpha) * g_x1[-1])
-        g_y1.append(alpha * min_y + (1 - alpha) * g_y1[-1])
-        g_y2.append(alpha * max_x + (1 - alpha) * g_y2[-1])
-        g_x2.append(alpha * max_y + (1 - alpha) * g_x2[-1])
-
-    return df,out
+        # Draw Dots (Joints)
+        for k_idx, k_name in KEYPOINT_DICT.items():
+            pt, conf = get_pt(k_name)
+            if conf > 0.5:
+                cv2.circle(frame, pt, 3, (255, 0, 0), -1)
 
 #go through the video once, track rowers and boats, save data to dataframe
 def process_video(args,cap,w,h):
