@@ -1,0 +1,19 @@
+# models/custom_botsort.yaml - COMPLETE & FIXED
+
+tracker_type: botsort
+track_high_thresh: 0.6   # High confidence to start tracking
+track_low_thresh: 0.1    # Keep lower conf in background
+new_track_thresh: 0.7    # Strict: Only start new IDs if very confident
+track_buffer: 4          # Keep lost tracks alive for 4 frames
+match_thresh: 0.8        # High = Lenient matching (helps with camera shake)
+fuse_score: True         # Use confidence score in matching
+
+# BoT-SORT specific
+gmc_method: sparseOptFlow
+# gmc_method: none       # Use 'none' if you get OpenCV errors, but flow is better
+
+# ReID parameters (REQUIRED to be present, even if with_reid is False)
+proximity_thresh: 0.5    # Spatial threshold
+appearance_thresh: 0.25  # Appearance threshold
+with_reid: False         # Disable ReID (uniforms confuse it anyway)
+
