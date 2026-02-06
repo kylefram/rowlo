@@ -21,43 +21,41 @@ OUTPUT_CSV_DIR = "output_data/"
 
 PADDING=.3
 #https://docs.ultralytics.com/tasks/pose/
-# 1=Nose
-# 2=Left Eye
-# 3=Right Eye
-# 4=Left Ear
-# 5=Right Ear
-# 6=Left Shoulder
-# 7=Right Shoulder
-# 8=Left Elbow
-# 9=Right Elbow
-# 10=Left Wrist
-# 11=Right Wrist
-# 12=Left Hip
-# 13=Right Hip
-# 14=Left Knee
-# 15=Right Knee
-# 16=Left Ankle
-# 17=Right Ankle
-KEYPOINT_INDICES = [1,6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-KEYPOINT_DICT = {1:"Nose", 6: "L_Shoulder", 7: "R_Shoulder", 8: "L_Elbow", 9: "R_Elbow", 10: "L_Wrist", 11: "R_Wrist", 12: "L_Hip", 13: "R_Hip", 14: "L_Knee", 15: "R_Knee", 16: "L_Ankle", 17: "R_Ankle"}
-#useful for reference
-NOSE=[1]
-SKELETON_UPPER_BODY = [(6,7), (6, 8), (8, 10), (7, 9), (9, 11)]
-SKELETON_TRUNK = [(6,12), (7,13), (12,13), (12,14), (13,15)]
+# Shift all keys down by 1 to match YOLO 0-based indexing
+KEYPOINT_DICT = {
+    0: "Nose",
+    5: "L_Shoulder",
+    6: "R_Shoulder", 
+    7: "L_Elbow", 
+    8: "R_Elbow", 
+    9: "L_Wrist", 
+    10: "R_Wrist", 
+    11: "L_Hip", 
+    12: "R_Hip", 
+    13: "L_Knee", 
+    14: "R_Knee", 
+    15: "L_Ankle", 
+    16: "R_Ankle"
+}
+
+# UPDATE YOUR SKELETON LISTS
+# These also need to shift down by 1 to match the new dictionary keys
+SKELETON_UPPER_BODY = [(5,6), (5,7), (7,9), (6,8), (8,10)]
+SKELETON_TRUNK = [(5,11), (6,12), (11,12), (11,13), (12,14)]
 #default boat configuration
-DEF_BOAT = {1:'s',2:'p',3:'s',4:'p',5:'s',6:'p',7:'s',8:'p',9:'c'}
 
 def parse_args():
     p = argparse.ArgumentParser(description="Joint angle detection from video file")
     p.add_argument("--device", type=str, default=DEVICE, required=False, help="Device to run the model on (e.g., 'cpu', 'cuda', 'mps')")
     p.add_argument("--video", type=str, default=VIDEO_PATH, required=False, help="Path to input video file")
-    p.add_argument("--def_boat", type=str, default=DEF_BOAT, required=False, help="s=starboard, p=port, c=coxswain")
+    p.add_argument("--def_boat", type=str, default="spspspspc", required=False, help="s=starboard, p=port, c=coxswain")
     p.add_argument("--detection_model", type=str, default=DETECTION_MODEL_PATH, required=False, help="Path to yolov8 pose weights (.pt)")
     p.add_argument("--pose_model", type=str, default=POSE_MODEL_PATH, required=False, help="Path to yolov8 pose weights (-pose.pt)")
     p.add_argument("--tracker", type=str, default=TRACK_MODEL, required=False, help="Path to tracker config file")
     p.add_argument("--output_video", type=str, default=OUTPUT_VIDEO_PATH, required=False, help="Path to save the output video file")
     p.add_argument("--output_csv_dir", type=str, default=OUTPUT_CSV_DIR, required=False, help="Path to save the output CSV file")
     p.add_argument("--max_frames", type=int, default=60, required=False, help="Maximum number of frames to process from the video")
+    p.add_argument("--alpha", type=float, default=0.3, required=False, help="Smoothing factor for camera stabilization (0-1, lower is smoother)")
 
     return p.parse_args()
 
@@ -76,20 +74,14 @@ def main():
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps    = int(cap.get(cv2.CAP_PROP_FPS))
 
-    print(f"Video properties: {width}x{height} at {fps} FPS")   
-
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    input_name = args.video.split("/")[-1].split(".")[0]
-    output_video = args.output_video + f"{input_name}_annotated.mp4"
-    out = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
-
     #first pass: track boat and rowers
     data = process_video(args,cap,width,height)
     df = pd.DataFrame(data)
-    df = df_postprocess(df)
+    df = df_postprocess(df,args.def_boat)
 
-    df,out = second_pass(args,cap,out,df)
-
+    df,out = second_pass(args,cap,df,alpha=args.alpha)
+    
+    input_name = args.video.split("/")[-1].split(".")[0]
     output_csv = args.output_csv_dir + f"{input_name.split('.')[0].split('/')[-1]}_data.csv"
     df.to_csv(output_csv)
 
@@ -98,112 +90,166 @@ def main():
     out.release()
     cv2.destroyAllWindows()
     #save video 
-    print(f"Annotated video saved to {output_video}")
     return df
 
-#dynamic crop, drawing skeletons, and adding charts
-def second_pass(args,cap,out,df,alp=0.7):
+def second_pass(args, cap, df, alpha=0.05): # Alpha lowered to 0.05 for smoother cam
+    print("Computing stable crop window...")
 
-    bounds = df.groupby('frame')[['x1', 'y1', 'x2', 'y2']].agg(
-        {'x1': 'min', 'y1': 'min', 'x2': 'max', 'y2': 'max'}
-    ).reindex(range(args.max_frames)).interpolate(method='linear')
-
-    # Calculate the center (cx, cy) of the bounding box
-    bounds['cx'] = (bounds['x1'] + bounds['x2']) / 2
-    bounds['cy'] = (bounds['y1'] + bounds['y2']) / 2
-
-    # Apply Exponential Weighted Moving Average (EWM) for smooth camera motion
-    # Lower alpha = smoother camera, higher alpha = more twitchy
-    smooth_ops = bounds[['cx', 'cy']].ewm(alpha=alp).mean()
-    bounds['smooth_cx'] = smooth_ops['cx']
-    bounds['smooth_cy'] = smooth_ops['cy']
+    # --- 1. Compute Stable Center (Centroid) ---
+    # Instead of (min+max)/2, we take the mean of ALL points.
+    # If one person flickers, the mean of the other ~150 points barely moves.
+    frame_centroids = df.groupby('frame')[['x', 'y']].mean()
     
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Reset video to start
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # Reindex to ensure we have an entry for every frame (fill missing with previous known spot)
+    # This handles cases where the boat completely disappears (rare, but good for safety)
+    full_idx = range(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+    frame_centroids = frame_centroids.reindex(full_idx).interpolate(method='linear').ffill().bfill()
 
-    # Pre-calculate center of the screen
-    screen_cx, screen_cy = w // 2, h // 2
+    # Apply Heavy Smoothing
+    smooth_cx = frame_centroids['x'].ewm(alpha=alpha).mean()
+    smooth_cy = frame_centroids['y'].ewm(alpha=alpha).mean()
 
-    for i in tqdm(range(args.max_frames), desc="Stabilizing & Annotating"):
+    # --- 2. Determine Static Crop Dimensions ---
+    # We need a box big enough to hold the boat relative to our new Centroid.
+    # For every frame, we check: How far is the furthest point from the Centroid?
+    
+    # Join the smoothed center back to the main DF
+    df_merged = df.merge(smooth_cx.rename('cx'), on='frame').merge(smooth_cy.rename('cy'), on='frame')
+    
+    # Calculate distance from center to edges
+    df_merged['dist_x_left']  = df_merged['cx'] - df_merged['x'] # Positive if point is left of center
+    df_merged['dist_x_right'] = df_merged['x'] - df_merged['cx'] # Positive if point is right of center
+    df_merged['dist_y_top']   = df_merged['cy'] - df_merged['y']
+    df_merged['dist_y_bot']   = df_merged['y'] - df_merged['cy']
+    
+    # Find the maximum necessary reach from the center
+    # We use quantile(0.99) instead of max() to ignore extreme single-pixel outliers/glitches
+    margin = 150
+    max_reach_left  = df_merged['dist_x_left'].quantile(0.995) + margin
+    max_reach_right = df_merged['dist_x_right'].quantile(0.995) + margin
+    max_reach_up    = df_merged['dist_y_top'].quantile(0.995) + margin
+    max_reach_down  = df_merged['dist_y_bot'].quantile(0.995) + margin
+    
+    # Total Width/Height needed
+    req_w = int(max_reach_left + max_reach_right)
+    req_h = int(max_reach_up + max_reach_down)
+    
+    # Clamp to original video size
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    CROP_W = min(req_w, orig_w)
+    CROP_H = min(req_h, orig_h)
+    
+    # Canvas Settings
+    SKELETON_H = 350 # Fixed height for skeleton strip
+    CANVAS_W = CROP_W
+    CANVAS_H = CROP_H + SKELETON_H
+    
+    print(f"Canvas: {CANVAS_W}x{CANVAS_H} (Crop: {CROP_W}x{CROP_H})")
+
+    # Re-init Writer
+    output_filename = args.output_video + f"{args.video.split('/')[-1].split('.')[0]}_final.mp4"
+    out = cv2.VideoWriter(output_filename, cv2.VideoWriter_fourcc(*'mp4v'), 30, (CANVAS_W, CANVAS_H))
+
+    # --- 3. Render Loop ---
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    
+    # Pre-calculate the "Window Center" (Where the centroid should sit in the output)
+    # If the boat is asymmetric (more length behind centroid), we shift the window center slightly
+    # to ensure the crop fits perfectly around the centroid.
+    win_cx = int(max_reach_left) 
+    win_cy = int(max_reach_up)
+
+    df_indexed = df.set_index('frame')
+
+    for i in tqdm(range(args.max_frames), desc="Rendering Stabilized"):
         ret, frame = cap.read()
-        if not ret: 
-            break
+        if not ret: break
 
-        # If we have tracking data for this frame
-        if i in bounds.index:
-            # Calculate the shift needed: Target (Screen Center) - Source (Rower Center)
-            src_cx = bounds.loc[i, 'smooth_cx']
-            src_cy = bounds.loc[i, 'smooth_cy']
+        master_canvas = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
+
+        # Retrieve smoothed center for this frame
+        curr_cx = smooth_cx.iloc[i] if i < len(smooth_cx) else smooth_cx.iloc[-1]
+        curr_cy = smooth_cy.iloc[i] if i < len(smooth_cy) else smooth_cy.iloc[-1]
+        
+        # Calculate Shift: Move (curr_cx, curr_cy) to (win_cx, win_cy)
+        dx = int(win_cx - curr_cx)
+        dy = int(win_cy - curr_cy)
+
+        # --- TOP: Video ---
+        M = np.float32([[1, 0, dx], [0, 1, dy]])
+        video_crop = cv2.warpAffine(frame, M, (CROP_W, CROP_H), borderValue=(0,0,0))
+        master_canvas[0:CROP_H, 0:CROP_W] = video_crop
+        
+        # --- BOTTOM: Skeletons ---
+        try:
+            frame_data = df_indexed.loc[i]
+            if isinstance(frame_data, pd.Series): 
+                frame_data = frame_data.to_frame().T
             
-            dx = screen_cx - src_cx
-            dy = screen_cy - src_cy
-
-            # Create Affine Translation Matrix
-            M = np.float32([[1, 0, dx], [0, 1, dy]])
-
-            # Apply shift (stabilization). borderValue=(0,0,0) creates the black mask.
-            stabilized_frame = cv2.warpAffine(frame, M, (w, h), borderValue=(0, 0, 0))
-
-            # Filter data for current frame
-            frame_data = df[df['frame'] == i]
+            # The skeleton strip is centered horizontally same as video
+            # Vertically, we center it in the SKELETON_H strip
+            # We use the same 'dx' to keep horizontal alignment with the video
             
-            # Draw skeletons on the stabilized frame
-            # We must pass dx, dy so we can shift the keypoints to match the video
-            draw_skeleton_from_df(stabilized_frame, frame_data, dx, dy)
+            # We want the 'centroid' of the skeletons to be in the middle of the bottom strip
+            strip_center_y = CROP_H + (SKELETON_H // 2)
             
-            out.write(stabilized_frame)
-        else:
-            # Write original frame if no tracking data exists
-            out.write(frame)
+            # Use the same 'dy' logic but targeted at the strip center
+            # Actually, reusing dy + offset keeps it "locked" to the video movement,
+            # which is usually preferred so they move in sync.
+            draw_skeletons(master_canvas, frame_data, dx, dy,True)
+            draw_skeletons(master_canvas, frame_data, dx, dy + CROP_H)
+            
+        except KeyError:
+            pass 
 
-    return df, out  
+        out.write(master_canvas)
 
-def draw_skeleton_from_df(frame, frame_df, dx, dy):
-    """
-    Draws skeletons from the DataFrame. 
-    Applies dx/dy offset to match the stabilized video.
-    """
-    # Pivot so we can access anatomy by ID: index=id, columns=keypoint
-    # We only care about x, y, confidence
+    return df, out
+
+def draw_skeletons(canvas, frame_df, dx, dy, include_labels=False):
     pivoted = frame_df.pivot(index='id', columns='keypoint', values=['x', 'y', 'confidence'])
+    
+    # Get seat labels (they are the same for all keypoints of an ID, so just take first)
+    # We iterate unique IDs in the frame
+    unique_ids = frame_df['id'].unique()
+    
+    for person_id in unique_ids:
+        # Extract row for this person
+        if person_id not in pivoted.index: continue
+        row = pivoted.loc[person_id]
+        
+        # Get Seat Label
+        seat_label = frame_df[frame_df['id'] == person_id]['seat_label'].iloc[0]
 
-    for person_id, row in pivoted.iterrows():
-        # Helper to get (x,y) tuple shifted by dx, dy
         def get_pt(name):
             try:
                 x = int(row['x'][name] + dx)
                 y = int(row['y'][name] + dy)
-                conf = row['confidence'][name]
-                return (x, y), conf
-            except KeyError:
-                return None, 0.0
+                return (x, y)
+            except:
+                return None
 
-        # Draw Lines (Limbs)
-        # Using SKELETON_UPPER_BODY and SKELETON_TRUNK global definitions
-        # Note: Your globals use Indices (6,7), but DF uses Names ("L_Shoulder")
-        # We need to map indices back to names for the DF lookup
-        
+        # Draw Limbs
         all_connections = SKELETON_UPPER_BODY + SKELETON_TRUNK
         colors = [(0, 255, 0)] * len(SKELETON_UPPER_BODY) + [(0, 0, 255)] * len(SKELETON_TRUNK)
-        
+
         for connection, color in zip(all_connections, colors):
-            k1_idx, k2_idx = connection
-            k1_name = KEYPOINT_DICT.get(k1_idx)
-            k2_name = KEYPOINT_DICT.get(k2_idx)
+            k1_name = KEYPOINT_DICT.get(connection[0]) # KEYPOINT_DICT must be 0-based now
+            k2_name = KEYPOINT_DICT.get(connection[1])
             
             if k1_name and k2_name:
-                pt1, conf1 = get_pt(k1_name)
-                pt2, conf2 = get_pt(k2_name)
-                
-                if conf1 > 0.5 and conf2 > 0.5: # Threshold
-                    cv2.line(frame, pt1, pt2, color, 2)
-
-        # Draw Dots (Joints)
-        for k_idx, k_name in KEYPOINT_DICT.items():
-            pt, conf = get_pt(k_name)
-            if conf > 0.5:
-                cv2.circle(frame, pt, 3, (255, 0, 0), -1)
+                pt1 = get_pt(k1_name)
+                pt2 = get_pt(k2_name)
+                if pt1 and pt2:
+                    cv2.line(canvas, pt1, pt2, color, 2)
+        
+        # Draw Label (Above Head)
+        nose_pt = get_pt("Nose")
+        if nose_pt and include_labels:
+            label_pos = (nose_pt[0] - 10, nose_pt[1] - 20)
+            cv2.putText(canvas, str(seat_label), label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
 #go through the video once, track rowers and boats, save data to dataframe
 def process_video(args,cap,w,h):
@@ -218,9 +264,6 @@ def process_video(args,cap,w,h):
         if not cap.isOpened():
             break
 
-        #white canvas
-        #canvas = np.ones((height, width, 3), dtype=np.uint8) * 255
-
         detection_results = detection.track(frame, persist=True, tracker=args.tracker, classes=[0],device=args.device,verbose=False)[0]
         boxes = detection_results.boxes
         ids = detection_results.boxes.id.cpu().numpy()
@@ -233,8 +276,6 @@ def process_video(args,cap,w,h):
                 person_crop = frame[y1:y2, x1:x2]
                 pose_results = pose(person_crop, device=args.device,verbose=False)[0]
         
-                #draw_skeleton(frame[y1:y2, x1:x2], pose_results.keypoints.data.cpu().numpy())
-                #draw_skeleton(canvas[y1:y2, x1:x2], pose_results.keypoints.data.cpu().numpy())
                 data.extend(database_append_rower(i, id, x1, x2, y1, y2, pose_results.keypoints.data.cpu().numpy()))
             elif box.cls[0] == 8:  # boat
                 print("Boat detected")
@@ -242,31 +283,79 @@ def process_video(args,cap,w,h):
                 data.append(database_append_boat(i, id, x1, y1, x2, y2))
     return data
         
+def df_postprocess(df, boat_config="spspspspc"):
+    """
+    1. Interpolates missing tracking data.
+    2. Ranks actors Left-to-Right (Ascending X) to match boat_config order.
+    3. Maps ranks to Seat Names (Bow, 2, 3... Stroke, Cox).
+    """
+    # --- 1. Vectorized Interpolation ---
+    # Create a dense grid of Frame x ID x Keypoint to handle missing data
+    # This ensures every person has a row for every frame, even if YOLO missed them
+    full_idx = pd.MultiIndex.from_product(
+        [range(df.frame.min(), df.frame.max() + 1), df.id.unique(), df.keypoint.unique()],
+        names=['frame', 'id', 'keypoint']
+    )
+    
+    # Reindex
+    df = df.set_index(['frame', 'id', 'keypoint']).reindex(full_idx)
+    
+    # CHANGE: Add limit to interpolation
+    # limit=30 means: If a rower is missing for >30 frames (1 sec), DON'T connect the dots.
+    # This prevents lines streaking across the screen when IDs swap.
+    df[['x', 'y']] = df[['x', 'y']].interpolate(method='linear', limit=30, limit_direction='both')
+    
+    df = df.reset_index()
+    
+    # Filter out rows that are STILL NaN after interpolation (meaning the gap was too big)
+    # This cleans up the "ghost" tracks that shouldn't exist.
+    df = df.dropna(subset=['x', 'y'])
+    
+    # Fill static columns (like confidence) that got NaN'd by reindex
+    df['confidence'] = df['confidence'].interpolate(linear=True, limit_direction='both').fillna(0)
 
-def df_postprocess(df,seat_encoding=DEF_BOAT):
-    #group by frame and keypoint to compute distances
-    dfg=df.groupby(['frame','keypoint']).apply(distance_func,include_groups=False).reset_index()
-    #assign seats
-    seat_positions = {}
-    for _, row in dfg.iterrows():
-        ordered_ids = row['ordered_ids']
-        for pos, id_val in enumerate(ordered_ids):
-            seat_positions.setdefault(id_val, []).append(pos)
+    # --- 2. Determine Seat Order (Left -> Right) ---
+    # Calculate the average X position of each person in each frame
+    # Rank them: 1 = Leftmost (Low X), N = Rightmost (High X)
+    frame_ranks = df.groupby(['frame', 'id'])['x'].mean().groupby('frame').rank(method='first', ascending=True)
     
-    # Compute seat_map using mode of positions
-    seat_map = {}
-    for id_val, locs in seat_positions.items():
-        if locs:
-            mode_pos = scipy.stats.mode(locs, keepdims=False).mode
-            seat_map[id_val] = int(mode_pos) + 1  # Seat numbers start at 1
-        else:
-            seat_map[id_val] = -1
+    # Find the most frequent rank for each ID (Mode) to assign a permanent seat
+    # (Subtract 1 to make it 0-indexed for string lookup)
+    id_seat_indices = frame_ranks.reset_index().groupby('id')['x'].agg(lambda x: x.mode()[0] - 1).astype(int)
+
+    # --- 3. Map Indices to Names/Sides ---
+    def get_seat_info(idx):
+        if idx < 0 or idx >= len(boat_config): 
+            return "Unknown", "?"
+        
+        side = boat_config[idx]
+        
+        # Naming Logic based on boat length
+        is_last = (idx == len(boat_config) - 1)
+        is_second_last = (idx == len(boat_config) - 2)
+        last_is_cox = (boat_config[-1] == 'c')
+
+        if idx == 0: 
+            name = "Bow"
+        elif is_last and side == 'c': 
+            name = "Cox"
+        elif is_last: 
+            name = "Stroke"
+        elif is_second_last and last_is_cox: 
+            name = "Stroke"
+        else: 
+            name = str(idx + 1)
+            
+        return name, side
+
+    # Create mapping dictionaries
+    seat_info_map = {uid: get_seat_info(idx) for uid, idx in id_seat_indices.items()}
     
-    df['seat_label']=df['id'].map(lambda x: seat_map.get(x,-1))
-    df['seat_side']=df['seat_label'].map(lambda x: seat_encoding.get(x,'unknown'))
+    # Apply to DataFrame
+    df['seat_label'] = df['id'].map(lambda x: seat_info_map.get(x, ("?", "?"))[0])
+    df['seat_side']  = df['id'].map(lambda x: seat_info_map.get(x, ("?", "?"))[1])
+    
     return df
-
-
 
 def distance_func(x):
     # Sort keypoints from right to left (assuming higher x is right)
@@ -285,33 +374,6 @@ def distance_func(x):
     #d['y'] = x['y']
 
     return pd.Series(d)
-
-def draw_skeleton(frame,keypoints):
-    if keypoints is None or len(keypoints) == 0:
-        print ("No keypoints detected.")
-        return
-    
-    for connection in SKELETON_UPPER_BODY:
-        part_a = connection[0]-1
-        part_b = connection[1]-1
-        if keypoints[0,part_a][2] > 0.2 and keypoints[0,part_b][2] > 0.2:
-            x1, y1 = int(keypoints[0,part_a][0]), int(keypoints[0,part_a][1])
-            x2, y2 = int(keypoints[0,part_b][0]), int(keypoints[0,part_b][1])
-            cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
-    
-    for connection in SKELETON_TRUNK:
-        part_a = connection[0]-1
-        part_b = connection[1]-1
-        if keypoints[0,part_a][2] > 0.2 and keypoints[0,part_b][2] > 0.2:
-            x1, y1 = int(keypoints[0,part_a][0]), int(keypoints[0,part_a][1])
-            x2, y2 = int(keypoints[0,part_b][0]), int(keypoints[0,part_b][1])
-            cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 1)
-
-    for dot in KEYPOINT_DICT.keys():
-        idx = dot - 1
-        if keypoints[0,idx][2] > 0.2:
-            x, y = int(keypoints[0,idx][0]), int(keypoints[0,idx][1])
-            cv2.circle(frame, (x, y), 2, (255, 0, 0), -1)
 
 def database_append_rower(frame_num, rower_id,x1,x2,y1,y2, keypoints):
     keypoints_data = []
