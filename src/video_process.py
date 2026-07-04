@@ -36,6 +36,9 @@ def parse_args():
     p.add_argument("--output_video", type=str, default=OUTPUT_VIDEO_PATH)
     p.add_argument("--output_csv_dir", type=str, default=OUTPUT_CSV_DIR)
     p.add_argument("--max_frames", type=int, default=60)
+    p.add_argument("--imgsz", type=int, default=1280)
+    p.add_argument("--conf", type=float, default=0.25)
+    p.add_argument("--iou", type=float, default=0.7)
     p.add_argument("--alpha", type=float, default=0.05)
     p.add_argument("--trim_start", type=int, default=0)
     p.add_argument("--trim_end", type=int, default=0)
@@ -169,18 +172,59 @@ def process_video(args, cap, w, h):
         if not ret: break
 
         # Track
-        res = det.track(frame, persist=True, tracker=args.tracker, classes=[0], device=args.device, verbose=False)[0]
+        res = det.track(frame, persist=True, tracker=args.tracker, classes=[0], device=args.device,
+                        verbose=False, imgsz=args.imgsz, conf=args.conf, iou=args.iou)[0]
         if res.boxes.id is None: continue
 
+        # Collect crops, then run pose on all of them in one batched call
+        crops, metas = [], []
         for id, box in zip(res.boxes.id.cpu().numpy(), res.boxes):
             x1, y1, x2, y2 = compute_box(*box.xyxy[0], PADDING, w, h)
             crop = frame[y1:y2, x1:x2]
             if crop.size == 0: continue
-            
-            # Pose
-            kpts = pose(crop, device=args.device, verbose=False)[0].keypoints.data.cpu().numpy()
+            crops.append(crop)
+            metas.append((id, x1, y1))
+
+        if not crops: continue
+        for result, (id, x1, y1) in zip(pose(crops, device=args.device, verbose=False), metas):
+            kpts = result.keypoints.data.cpu().numpy()
             data.extend(append_rower(i, id, x1, y1, kpts))
     return data
+
+def stitch_tracks(df, max_gap=450):
+    """Merge track fragments belonging to the same rower.
+
+    The boat is rigid, so each person's x-position relative to the crew centroid
+    is nearly constant. If one track ends and another starts later at the same
+    relative position (e.g. the cox drifting out of frame and back), they are
+    the same person.
+    """
+    pos = df.groupby(['frame', 'id'])[['x', 'y']].mean().reset_index()
+    cent = pos.groupby('frame')[['x', 'y']].transform('mean')
+    pos['rel_x'] = pos['x'] - cent['x']
+
+    span = pos.groupby('frame')['rel_x'].agg(lambda s: s.max() - s.min()).median()
+    tol = span * 0.06  # roughly half a seat spacing in an 8+
+
+    info = pos.groupby('id').agg(start=('frame', 'min'), end=('frame', 'max'),
+                                 relx=('rel_x', 'median')).sort_values('start')
+
+    canonical = {}  # fragment id -> surviving id
+    open_tracks = []  # (end_frame, relx, root_id) of tracks that may continue
+    for tid, row in info.iterrows():
+        merged = False
+        for k, (end, relx, root) in enumerate(open_tracks):
+            if end < row['start'] and row['start'] - end <= max_gap and abs(row['relx'] - relx) < tol:
+                canonical[tid] = root
+                open_tracks[k] = (row['end'], row['relx'], root)
+                merged = True
+                break
+        if not merged:
+            canonical[tid] = tid
+            open_tracks.append((row['end'], row['relx'], tid))
+
+    df['id'] = df['id'].map(canonical)
+    return df
         
 def df_postprocess(df, boat_config):
     # 1. Clean Glitches (Spread > 3x Median)
@@ -190,20 +234,30 @@ def df_postprocess(df, boat_config):
     bad_ids = stats[stats['diag'] > limit].index
     df = df.set_index(['frame','id']).drop(bad_ids, errors='ignore').reset_index()
 
-    # 2. Interpolate
+    # 2. Merge track fragments, then keep the N best tracks for an N-seat boat
+    df = stitch_tracks(df)
+    n_seats = len(boat_config)
+    presence = df.groupby('id')['frame'].nunique().sort_values(ascending=False)
+    keep = presence.index[:n_seats]
+    df = df[df['id'].isin(keep)]
+
+    # 3. Interpolate
     idx = pd.MultiIndex.from_product([range(df.frame.min(), df.frame.max()+1), df.id.unique(), df.keypoint.unique()], names=['frame','id','keypoint'])
     df = df.set_index(['frame','id','keypoint']).reindex(idx)
     df[['x','y']] = df[['x','y']].interpolate(limit=30, limit_direction='both')
     df = df.reset_index().dropna(subset=['x'])
-    
-    # 3. GLOBAL SEAT ASSIGNMENT (Fixes Flickering)
-    # Instead of ranking every frame, we calculate the MEDIAN X position for every ID 
-    # across the ENTIRE video.
-    id_median_x = df.groupby('id')['x'].median()
-    
-    # Sort IDs by their median X position (Left to Right)
-    sorted_ids = id_median_x.sort_values().index.tolist()
-    
+
+    # 4. GLOBAL SEAT ASSIGNMENT (Fixes Flickering)
+    # Rank each ID by its median x-position RELATIVE to the per-frame crew
+    # centroid. Raw x breaks when the camera pans or a track only exists for
+    # part of the video; relative x is constant because the boat is rigid.
+    pos = df.groupby(['frame','id'])['x'].mean().reset_index()
+    pos['rel_x'] = pos['x'] - pos.groupby('frame')['x'].transform('mean')
+    id_rel_x = pos.groupby('id')['rel_x'].median()
+
+    # Sort IDs by their relative position (Left to Right)
+    sorted_ids = id_rel_x.sort_values().index.tolist()
+
     # Assign seats based on this global sort order
     def get_name(rank):
         if rank < 0 or rank >= len(boat_config): return "?"
@@ -213,7 +267,7 @@ def df_postprocess(df, boat_config):
 
     # Map ID -> Rank -> Name
     id_to_seat = {uid: get_name(i) for i, uid in enumerate(sorted_ids)}
-    
+
     df['seat_label'] = df['id'].map(id_to_seat)
     return df
 
